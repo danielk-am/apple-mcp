@@ -25,6 +25,7 @@ let reminders: typeof import("./utils/reminders").default | null = null;
 
 let calendar: typeof import("./utils/calendar").default | null = null;
 let maps: typeof import("./utils/maps").default | null = null;
+let photos: typeof import("./utils/photos").default | null = null;
 
 // Type map for module names to their types
 type ModuleMap = {
@@ -35,6 +36,7 @@ type ModuleMap = {
 	reminders: typeof import("./utils/reminders").default;
 	calendar: typeof import("./utils/calendar").default;
 	maps: typeof import("./utils/maps").default;
+	photos: typeof import("./utils/photos").default;
 };
 
 // Helper function for lazy module loading
@@ -46,7 +48,8 @@ async function loadModule<
 		| "mail"
 		| "reminders"
 		| "calendar"
-		| "maps",
+		| "maps"
+		| "photos",
 >(moduleName: T): Promise<ModuleMap[T]> {
 	if (safeModeFallback) {
 		console.error(`Loading ${moduleName} module on demand (safe mode)...`);
@@ -75,6 +78,9 @@ async function loadModule<
 			case "maps":
 				if (!maps) maps = (await import("./utils/maps")).default;
 				return maps as ModuleMap[T];
+			case "photos":
+				if (!photos) photos = (await import("./utils/photos")).default;
+				return photos as ModuleMap[T];
 			default:
 				throw new Error(`Unknown module: ${moduleName}`);
 		}
@@ -99,6 +105,8 @@ loadingTimeout = setTimeout(() => {
 	mail = null;
 	reminders = null;
 	calendar = null;
+	maps = null;
+	photos = null;
 
 	// Proceed with server setup
 	initServer();
@@ -132,6 +140,9 @@ async function attemptEagerLoading() {
 		maps = (await import("./utils/maps")).default;
 		console.error("- Maps module loaded successfully");
 
+		photos = (await import("./utils/photos")).default;
+		console.error("- Photos module loaded successfully");
+
 		// If we get here, clear the timeout and proceed with eager loading
 		if (loadingTimeout) {
 			clearTimeout(loadingTimeout);
@@ -160,8 +171,9 @@ async function attemptEagerLoading() {
 		message = null;
 		mail = null;
 		reminders = null;
-			calendar = null;
+		calendar = null;
 		maps = null;
+		photos = null;
 
 		// Initialize the server in safe mode
 		initServer();
@@ -1277,6 +1289,123 @@ end tell`;
 					}
 				}
 
+				case "photos": {
+					if (!isPhotosArgs(args)) {
+						throw new Error("Invalid arguments for photos tool");
+					}
+
+					try {
+						const photosModule = await loadModule("photos");
+						const { operation } = args;
+
+						switch (operation) {
+							case "listAlbums": {
+								const albums = await photosModule.listAlbums();
+								return {
+									content: [
+										{
+											type: "text",
+											text:
+												albums.length > 0
+													? `Found ${albums.length} album(s):\n\n${albums.map((a) => `${a.name} (${a.count} photo${a.count === 1 ? "" : "s"})`).join("\n")}`
+													: "No albums found in Photos.",
+										},
+									],
+									albums,
+									isError: false,
+								};
+							}
+
+							case "getAlbum": {
+								if (!args.albumName) {
+									throw new Error("albumName is required for getAlbum operation");
+								}
+								const photos = await photosModule.getAlbum(args.albumName, args.limit);
+								return {
+									content: [
+										{
+											type: "text",
+											text:
+												photos.length > 0
+													? `Found ${photos.length} photo(s) in "${args.albumName}":\n\n${photos.map((p) => `${p.filename} — ${p.date}${p.description ? ` — ${p.description}` : ""}${p.favorite ? " ★" : ""}`).join("\n")}`
+													: `No photos found in album "${args.albumName}".`,
+										},
+									],
+									photos,
+									isError: false,
+								};
+							}
+
+							case "getFavorites": {
+								const photos = await photosModule.getFavorites(args.limit);
+								return {
+									content: [
+										{
+											type: "text",
+											text:
+												photos.length > 0
+													? `Found ${photos.length} favorite photo(s):\n\n${photos.map((p) => `${p.filename} — ${p.date}${p.description ? ` — ${p.description}` : ""}`).join("\n")}`
+													: "No favorite photos found.",
+										},
+									],
+									photos,
+									isError: false,
+								};
+							}
+
+							case "getRecent": {
+								const photos = await photosModule.getRecent(args.limit);
+								return {
+									content: [
+										{
+											type: "text",
+											text:
+												photos.length > 0
+													? `Found ${photos.length} recent photo(s):\n\n${photos.map((p) => `${p.filename} — ${p.date}${p.description ? ` — ${p.description}` : ""}${p.favorite ? " ★" : ""}`).join("\n")}`
+													: "No recent photos found.",
+										},
+									],
+									photos,
+									isError: false,
+								};
+							}
+
+							case "search": {
+								if (!args.searchText) {
+									throw new Error("searchText is required for search operation");
+								}
+								const result = await photosModule.search(args.searchText);
+								return {
+									content: [{ type: "text", text: result.message }],
+									isError: !result.success,
+								};
+							}
+
+							case "open": {
+								const result = await photosModule.open(args.albumName);
+								return {
+									content: [{ type: "text", text: result.message }],
+									isError: !result.success,
+								};
+							}
+
+							default:
+								throw new Error(`Unknown photos operation: ${operation}`);
+						}
+					} catch (error) {
+						const errorMessage = error instanceof Error ? error.message : String(error);
+						return {
+							content: [
+								{
+									type: "text",
+									text: errorMessage.includes("access") ? errorMessage : `Error in photos tool: ${errorMessage}`,
+								},
+							],
+							isError: true,
+						};
+					}
+				}
+
 				default:
 					return {
 						content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -1715,6 +1844,37 @@ function isMapsArgs(args: unknown): args is {
 			return false;
 		}
 	}
+
+	return true;
+}
+
+function isPhotosArgs(args: unknown): args is {
+	operation: "listAlbums" | "getAlbum" | "getFavorites" | "getRecent" | "search" | "open";
+	albumName?: string;
+	searchText?: string;
+	limit?: number;
+} {
+	if (typeof args !== "object" || args === null) return false;
+
+	const { operation } = args as { operation?: unknown };
+	if (typeof operation !== "string") return false;
+
+	if (!["listAlbums", "getAlbum", "getFavorites", "getRecent", "search", "open"].includes(operation)) {
+		return false;
+	}
+
+	if (operation === "getAlbum") {
+		const { albumName } = args as { albumName?: unknown };
+		if (typeof albumName !== "string" || albumName === "") return false;
+	}
+
+	if (operation === "search") {
+		const { searchText } = args as { searchText?: unknown };
+		if (typeof searchText !== "string" || searchText === "") return false;
+	}
+
+	const { limit } = args as { limit?: unknown };
+	if (limit !== undefined && typeof limit !== "number") return false;
 
 	return true;
 }

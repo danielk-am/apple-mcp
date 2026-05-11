@@ -291,6 +291,38 @@ const MAPS_TOOL: Tool = {
   }
 };
 
-const tools = [CONTACTS_TOOL, NOTES_TOOL, MESSAGES_TOOL, MAIL_TOOL, REMINDERS_TOOL, CALENDAR_TOOL, MAPS_TOOL];
+const PHOTOS_TOOL: Tool = {
+	name: "photos",
+	description:
+		"Browse albums, find favorites, view recent photos, and search Apple Photos library",
+	inputSchema: {
+		type: "object",
+		properties: {
+			operation: {
+				type: "string",
+				description:
+					"Operation to perform: 'listAlbums', 'getAlbum', 'getFavorites', 'getRecent', 'search', or 'open'",
+				enum: ["listAlbums", "getAlbum", "getFavorites", "getRecent", "search", "open"],
+			},
+			albumName: {
+				type: "string",
+				description:
+					"Name of the album to browse (required for getAlbum, optional for open)",
+			},
+			searchText: {
+				type: "string",
+				description:
+					"Text to search for — opens Photos with that search active (required for search operation)",
+			},
+			limit: {
+				type: "number",
+				description: "Maximum number of photos to return (optional, default 50)",
+			},
+		},
+		required: ["operation"],
+	},
+};
+
+const tools = [CONTACTS_TOOL, NOTES_TOOL, MESSAGES_TOOL, MAIL_TOOL, REMINDERS_TOOL, CALENDAR_TOOL, MAPS_TOOL, PHOTOS_TOOL];
 
 export default tools;
