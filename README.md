@@ -1,22 +1,12 @@
-# 🍎 Apple MCP - Better Siri that can do it all :)
+# 🍎 Apple MCP — Personal & Family Edition
 
-> **Plot twist:** Your Mac can do more than just look pretty. Turn your Apple apps into AI superpowers!
+A local-only MCP server for Apple apps, built for personal and family use. Each family member runs their own instance on their Mac; iCloud Shared Albums, shared Reminders lists, and shared Notes folders keep everything in sync across devices.
 
-Love this MCP? Check out supermemory MCP too - https://mcp.supermemory.ai
+Forked from [supermemoryai/apple-mcp](https://github.com/supermemoryai/apple-mcp) with one addition: **Photos** — the gap that existed in both the original and the upstream fork. Supports browsing albums, recent photos, favorites, and in-app search.
 
+---
 
-Click below for one click install with `.dxt`
-
-<a href="https://github.com/supermemoryai/apple-mcp/releases/download/1.0.0/apple-mcp.dxt">
-  <img  width="280" alt="Install with Claude DXT" src="https://github.com/user-attachments/assets/9b0fa2a0-a954-41ee-ac9e-da6e63fc0881" />
-</a>
-
-[![smithery badge](https://smithery.ai/badge/@Dhravya/apple-mcp)](https://smithery.ai/server/@Dhravya/apple-mcp)
-
-
-<a href="https://glama.ai/mcp/servers/gq2qg6kxtu">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/gq2qg6kxtu/badge" alt="Apple Server MCP server" />
-</a>
+> **Upstream:** [supermemoryai/apple-mcp](https://github.com/supermemoryai/apple-mcp) · [original by Dhravya Shah](https://github.com/jxnl/apple-mcp)
 
 ## 🤯 What Can This Thing Do?
 
@@ -68,6 +58,14 @@ Click below for one click install with `.dxt`
 - Get directions (finally stop asking Siri while driving)
 - Create guides (be that friend who plans everything)
 - Drop pins like you're claiming territory
+
+### 📸 **Photos** - Your memories, actually findable *(added in this fork)*
+
+- List all albums with photo counts
+- Browse any album by name
+- Pull up your favorites instantly
+- See what's been recently added
+- Search by keyword — opens Photos with results in view
 
 ## 🎭 The Magic of Chaining Commands
 
@@ -148,7 +146,7 @@ Here's a step-by-step video walkthrough: https://x.com/DhravyaShah/status/189269
 ## 🛠️ Local Development (For the Tinkerers)
 
 ```bash
-git clone https://github.com/dhravya/apple-mcp.git
+git clone https://github.com/danielk-am/apple-mcp.git
 cd apple-mcp
 bun install
 bun run index.ts
