@@ -94,46 +94,86 @@ async function getEvents(
         const startDate = fromDate ? fromDate : today.toISOString().split('T')[0];
         const endDate = toDate ? toDate : defaultEndDate.toISOString().split('T')[0];
         
+        // Convert ISO dates to AppleScript date literal format (locale string is most reliable)
+        const startD = new Date(startDate);
+        const endD = new Date(endDate);
+        // End of day for the toDate to include events that day
+        if (!toDate) {
+            endD.setHours(23, 59, 59, 999);
+        }
+        const startStr = startD.toLocaleString("en-US");
+        const endStr = endD.toLocaleString("en-US");
+        const maxEvents = Math.min(limit, CONFIG.MAX_EVENTS);
+
         const script = `
 tell application "Calendar"
-    set eventList to {}
-    set eventCount to 0
-    
-    -- Create a simple test event to return (since Calendar queries are too slow)
-    try
-        set testEvent to {}
-        set testEvent to testEvent & {id:"dummy-event-1"}
-        set testEvent to testEvent & {title:"No events available - Calendar operations too slow"}
-        set testEvent to testEvent & {calendarName:"System"}
-        set testEvent to testEvent & {startDate:"${startDate}"}
-        set testEvent to testEvent & {endDate:"${endDate}"}
-        set testEvent to testEvent & {isAllDay:false}
-        set testEvent to testEvent & {location:""}
-        set testEvent to testEvent & {notes:"Calendar.app AppleScript queries are notoriously slow and unreliable"}
-        set testEvent to testEvent & {url:""}
-        
-        set eventList to eventList & {testEvent}
-    end try
-    
-    return eventList
+    set output to {}
+    set totalCount to 0
+    set startD to date "${startStr}"
+    set endD to date "${endStr}"
+
+    repeat with cal in calendars
+        if totalCount >= ${maxEvents} then exit repeat
+        try
+            set calNm to name of cal
+            -- whose-clause filter is the key to making Calendar AppleScript usable
+            set evts to (events of cal whose start date is greater than or equal to startD and start date is less than or equal to endD)
+            set evtCount to count of evts
+            if evtCount > 0 then
+                set perCalLimit to ${maxEvents} - totalCount
+                if evtCount > perCalLimit then set evtCount to perCalLimit
+
+                -- Bulk-fetch properties (one round-trip each)
+                set eTitles to summary of evts
+                set eIds to uid of evts
+                set eStarts to start date of evts
+                set eEnds to end date of evts
+                set eAllDay to allday event of evts
+
+                repeat with i from 1 to evtCount
+                    set evt to item i of evts
+                    set eLoc to ""
+                    try
+                        set eLoc to location of evt
+                        if eLoc is missing value then set eLoc to ""
+                    end try
+                    set eNotes to ""
+                    try
+                        set eNotes to description of evt
+                        if eNotes is missing value then set eNotes to ""
+                    end try
+
+                    set end of output to {idd:(item i of eIds), ttl:(item i of eTitles), cal:calNm, sd:((item i of eStarts) as string), ed:((item i of eEnds) as string), allday:(item i of eAllDay), loc:eLoc, nts:eNotes}
+                    set totalCount to totalCount + 1
+                end repeat
+            end if
+        on error
+            -- skip problematic calendars
+        end try
+    end repeat
+
+    return output
 end tell`;
 
         const result = await runAppleScript(script) as any;
-        
-        // Convert AppleScript result to our format - handle both array and non-array results
-        const resultArray = Array.isArray(result) ? result : [];
-        const events: CalendarEvent[] = resultArray.map((eventData: any) => ({
-            id: eventData.id || `unknown-${Date.now()}`,
-            title: eventData.title || "Untitled Event",
-            location: eventData.location || null,
-            notes: eventData.notes || null,
-            startDate: eventData.startDate ? new Date(eventData.startDate).toISOString() : null,
-            endDate: eventData.endDate ? new Date(eventData.endDate).toISOString() : null,
-            calendarName: eventData.calendarName || "Unknown Calendar",
-            isAllDay: eventData.isAllDay || false,
-            url: eventData.url || null
-        }));
-        
+        const arr = Array.isArray(result) ? result : result ? [result] : [];
+
+        const events: CalendarEvent[] = arr.map((e: any) => {
+            const startParsed = e.sd ? new Date(e.sd) : null;
+            const endParsed = e.ed ? new Date(e.ed) : null;
+            return {
+                id: e.idd || `unknown-${Date.now()}`,
+                title: e.ttl || "Untitled Event",
+                location: e.loc || null,
+                notes: e.nts || null,
+                startDate: startParsed && !isNaN(startParsed.getTime()) ? startParsed.toISOString() : (e.sd || null),
+                endDate: endParsed && !isNaN(endParsed.getTime()) ? endParsed.toISOString() : (e.ed || null),
+                calendarName: e.cal || "Unknown Calendar",
+                isAllDay: e.allday === true || e.allday === "true",
+                url: null,
+            };
+        });
+
         return events;
     } catch (error) {
         console.error(`Error getting events: ${error instanceof Error ? error.message : String(error)}`);
@@ -170,31 +210,17 @@ async function searchEvents(
         const startDate = fromDate ? fromDate : today.toISOString().split('T')[0];
         const endDate = toDate ? toDate : defaultEndDate.toISOString().split('T')[0];
         
-        const script = `
-tell application "Calendar"
-    set eventList to {}
-    
-    -- Return empty list for search (Calendar queries are too slow)
-    return eventList
-end tell`;
+        // Fetch events in the date range, then filter by text on the JS side.
+        // AppleScript-side text filtering on summary is slow and brittle.
+        const candidates = await getEvents(CONFIG.MAX_EVENTS, startDate, endDate);
+        const needle = searchText.toLowerCase();
+        const matches = candidates.filter((e) =>
+            (e.title && e.title.toLowerCase().includes(needle)) ||
+            (e.location && e.location.toLowerCase().includes(needle)) ||
+            (e.notes && e.notes.toLowerCase().includes(needle))
+        );
 
-        const result = await runAppleScript(script) as any;
-        
-        // Convert AppleScript result to our format - handle both array and non-array results
-        const resultArray = Array.isArray(result) ? result : [];
-        const events: CalendarEvent[] = resultArray.map((eventData: any) => ({
-            id: eventData.id || `unknown-${Date.now()}`,
-            title: eventData.title || "Untitled Event",
-            location: eventData.location || null,
-            notes: eventData.notes || null,
-            startDate: eventData.startDate ? new Date(eventData.startDate).toISOString() : null,
-            endDate: eventData.endDate ? new Date(eventData.endDate).toISOString() : null,
-            calendarName: eventData.calendarName || "Unknown Calendar",
-            isAllDay: eventData.isAllDay || false,
-            url: eventData.url || null
-        }));
-        
-        return events;
+        return matches.slice(0, limit);
     } catch (error) {
         console.error(`Error searching events: ${error instanceof Error ? error.message : String(error)}`);
         return [];
@@ -326,25 +352,40 @@ async function openEvent(eventId: string): Promise<{ success: boolean; message: 
 
         console.error(`openEvent - Attempting to open event with ID: ${eventId}`);
 
+        const safeId = eventId.replace(/"/g, '\\"');
         const script = `
 tell application "Calendar"
     activate
-    return "Calendar app opened (event search too slow)"
+    try
+        -- Find the event across all calendars (uid is unique)
+        set found to false
+        repeat with cal in calendars
+            try
+                set matches to (events of cal whose uid is "${safeId}")
+                if (count of matches) > 0 then
+                    show (item 1 of matches)
+                    set found to true
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if found then
+            return "SUCCESS"
+        else
+            return "ERROR:Event not found"
+        end if
+    on error errMsg
+        return "ERROR:" & errMsg
+    end try
 end tell`;
 
         const result = await runAppleScript(script) as string;
-        
-        // Check if this looks like a non-existent event ID
-        if (eventId.includes("non-existent") || eventId.includes("12345")) {
-            return {
-                success: false,
-                message: "Event not found (test scenario)"
-            };
+        if (typeof result === "string" && result.startsWith("ERROR:")) {
+            return { success: false, message: result.replace("ERROR:", "") };
         }
-        
         return {
             success: true,
-            message: result
+            message: `Opened event ${eventId} in Calendar`
         };
     } catch (error) {
         return {

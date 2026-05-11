@@ -80,73 +80,73 @@ async function getUnreadMails(limit = 10): Promise<EmailMessage[]> {
 
 		const script = `
 tell application "Mail"
-    set emailList to {}
-    set emailCount to 0
+    set output to {}
+    set totalCount to 0
 
-    -- Get mailboxes (limited to avoid performance issues)
-    set allMailboxes to mailboxes
-
-    repeat with i from 1 to (count of allMailboxes)
-        if emailCount >= ${maxEmails} then exit repeat
-
+    -- Iterate accounts and their inboxes; whose-clause filter is the speed key
+    repeat with acct in accounts
+        if totalCount >= ${maxEmails} then exit repeat
         try
-            set currentMailbox to item i of allMailboxes
-            set mailboxName to name of currentMailbox
-
-            -- Get unread messages from this mailbox
-            set unreadMessages to messages of currentMailbox
-
-            repeat with j from 1 to (count of unreadMessages)
-                if emailCount >= ${maxEmails} then exit repeat
-
+            set acctName to name of acct
+            repeat with mb in (every mailbox of acct)
+                if totalCount >= ${maxEmails} then exit repeat
                 try
-                    set currentMsg to item j of unreadMessages
+                    set mbName to name of mb
+                    set unreadMsgs to (messages of mb whose read status is false)
+                    set msgCount to count of unreadMsgs
+                    if msgCount > 0 then
+                        set perBoxLimit to ${maxEmails} - totalCount
+                        if msgCount > perBoxLimit then set msgCount to perBoxLimit
 
-                    -- Only process unread messages
-                    if read status of currentMsg is false then
-                        set emailSubject to subject of currentMsg
-                        set emailSender to sender of currentMsg
-                        set emailDate to (date sent of currentMsg) as string
+                        repeat with j from 1 to msgCount
+                            try
+                                set m to item j of unreadMsgs
+                                set sub to subject of m
+                                set snd to sender of m
+                                set dt to (date sent of m) as string
+                                set body to ""
+                                try
+                                    set full to content of m
+                                    if (length of full) > ${CONFIG.MAX_CONTENT_PREVIEW} then
+                                        set body to (characters 1 thru ${CONFIG.MAX_CONTENT_PREVIEW} of full) as string
+                                        set body to body & "..."
+                                    else
+                                        set body to full
+                                    end if
+                                on error
+                                    set body to "[Content not available]"
+                                end try
 
-                        -- Get content with length limit
-                        set emailContent to ""
-                        try
-                            set fullContent to content of currentMsg
-                            if (length of fullContent) > ${CONFIG.MAX_CONTENT_PREVIEW} then
-                                set emailContent to (characters 1 thru ${CONFIG.MAX_CONTENT_PREVIEW} of fullContent) as string
-                                set emailContent to emailContent & "..."
-                            else
-                                set emailContent to fullContent
-                            end if
-                        on error
-                            set emailContent to "[Content not available]"
-                        end try
-
-                        set emailInfo to {subject:emailSubject, sender:emailSender, dateSent:emailDate, content:emailContent, isRead:false, mailbox:mailboxName}
-                        set emailList to emailList & {emailInfo}
-                        set emailCount to emailCount + 1
+                                set end of output to {sub:sub, snd:snd, dt:dt, body:body, mb:(acctName & " / " & mbName)}
+                                set totalCount to totalCount + 1
+                            on error
+                                -- skip problematic message
+                            end try
+                        end repeat
                     end if
                 on error
-                    -- Skip problematic messages
+                    -- skip problematic mailbox
                 end try
             end repeat
         on error
-            -- Skip problematic mailboxes
+            -- skip problematic account
         end try
     end repeat
 
-    return "SUCCESS:" & (count of emailList)
+    return output
 end tell`;
 
-		const result = (await runAppleScript(script)) as string;
+		const result = (await runAppleScript(script)) as any;
+		const arr = Array.isArray(result) ? result : result ? [result] : [];
 
-		if (result && result.startsWith("SUCCESS:")) {
-			// For now, return empty array as the actual email parsing from AppleScript is complex
-			// The key improvement is that we're not timing out anymore
-			return [];
-		}
-
-		return [];
+		return arr.map((e: any) => ({
+			subject: e.sub || "(no subject)",
+			sender: e.snd || "(unknown sender)",
+			dateSent: e.dt || "",
+			content: e.body || "",
+			isRead: false,
+			mailbox: e.mb || "Unknown",
+		}));
 	} catch (error) {
 		console.error(
 			`Error getting unread emails: ${error instanceof Error ? error.message : String(error)}`,
@@ -175,77 +175,79 @@ async function searchMails(
 		const maxEmails = Math.min(limit, CONFIG.MAX_EMAILS);
 		const cleanSearchTerm = searchTerm.toLowerCase();
 
+		const safeTerm = cleanSearchTerm.replace(/"/g, '\\"');
+
 		const script = `
 tell application "Mail"
-    set emailList to {}
-    set emailCount to 0
-    set searchTerm to "${cleanSearchTerm}"
+    set output to {}
+    set totalCount to 0
+    set needle to "${safeTerm}"
 
-    -- Get mailboxes (limited to avoid performance issues)
-    set allMailboxes to mailboxes
-
-    repeat with i from 1 to (count of allMailboxes)
-        if emailCount >= ${maxEmails} then exit repeat
-
+    repeat with acct in accounts
+        if totalCount >= ${maxEmails} then exit repeat
         try
-            set currentMailbox to item i of allMailboxes
-            set mailboxName to name of currentMailbox
-
-            -- Get messages from this mailbox
-            set allMessages to messages of currentMailbox
-
-            repeat with j from 1 to (count of allMessages)
-                if emailCount >= ${maxEmails} then exit repeat
-
+            set acctName to name of acct
+            repeat with mb in (every mailbox of acct)
+                if totalCount >= ${maxEmails} then exit repeat
                 try
-                    set currentMsg to item j of allMessages
-                    set emailSubject to subject of currentMsg
+                    set mbName to name of mb
+                    -- whose-clause filter on subject is faster than JS-side scanning
+                    set matches to (messages of mb whose subject contains needle)
+                    set msgCount to count of matches
+                    if msgCount > 0 then
+                        set perBoxLimit to ${maxEmails} - totalCount
+                        if msgCount > perBoxLimit then set msgCount to perBoxLimit
 
-                    -- Simple case-insensitive search in subject
-                    if emailSubject contains searchTerm then
-                        set emailSender to sender of currentMsg
-                        set emailDate to (date sent of currentMsg) as string
-                        set emailRead to read status of currentMsg
+                        repeat with j from 1 to msgCount
+                            try
+                                set m to item j of matches
+                                set sub to subject of m
+                                set snd to sender of m
+                                set dt to (date sent of m) as string
+                                set rd to read status of m
+                                set body to ""
+                                try
+                                    set full to content of m
+                                    if (length of full) > ${CONFIG.MAX_CONTENT_PREVIEW} then
+                                        set body to (characters 1 thru ${CONFIG.MAX_CONTENT_PREVIEW} of full) as string
+                                        set body to body & "..."
+                                    else
+                                        set body to full
+                                    end if
+                                on error
+                                    set body to "[Content not available]"
+                                end try
 
-                        -- Get content with length limit
-                        set emailContent to ""
-                        try
-                            set fullContent to content of currentMsg
-                            if (length of fullContent) > ${CONFIG.MAX_CONTENT_PREVIEW} then
-                                set emailContent to (characters 1 thru ${CONFIG.MAX_CONTENT_PREVIEW} of fullContent) as string
-                                set emailContent to emailContent & "..."
-                            else
-                                set emailContent to fullContent
-                            end if
-                        on error
-                            set emailContent to "[Content not available]"
-                        end try
-
-                        set emailInfo to {subject:emailSubject, sender:emailSender, dateSent:emailDate, content:emailContent, isRead:emailRead, mailbox:mailboxName}
-                        set emailList to emailList & {emailInfo}
-                        set emailCount to emailCount + 1
+                                set end of output to {sub:sub, snd:snd, dt:dt, body:body, rd:rd, mb:(acctName & " / " & mbName)}
+                                set totalCount to totalCount + 1
+                            on error
+                                -- skip problematic message
+                            end try
+                        end repeat
                     end if
                 on error
-                    -- Skip problematic messages
+                    -- skip problematic mailbox
                 end try
             end repeat
         on error
-            -- Skip problematic mailboxes
+            -- skip problematic account
         end try
     end repeat
 
-    return "SUCCESS:" & (count of emailList)
+    return output
 end tell`;
 
-		const result = (await runAppleScript(script)) as string;
+		const result = (await runAppleScript(script)) as any;
+		const arr = Array.isArray(result) ? result : result ? [result] : [];
 
-		if (result && result.startsWith("SUCCESS:")) {
-			// For now, return empty array as the actual email parsing from AppleScript is complex
-			// The key improvement is that we're not timing out anymore
-			return [];
-		}
-
-		return [];
+		return arr.map((e: any) => ({
+			subject: e.sub || "(no subject)",
+			sender: e.snd || "(unknown sender)",
+			dateSent: e.dt || "",
+			content: e.body || "",
+			isRead: e.rd === true || e.rd === "true",
+			mailbox: e.mb || "Unknown",
+		}));
 	} catch (error) {
 		console.error(
 			`Error searching emails: ${error instanceof Error ? error.message : String(error)}`,

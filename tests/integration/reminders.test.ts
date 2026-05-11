@@ -249,7 +249,7 @@ describe("Reminders Integration Tests", () => {
           
           // Check that requested properties are present
           for (const prop of properties) {
-            if (firstReminder[prop] !== undefined) {
+            if ((firstReminder as unknown as Record<string, unknown>)[prop] !== undefined) {
               console.log(`  Property "${prop}": present`);
             }
           }
