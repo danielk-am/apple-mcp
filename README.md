@@ -67,6 +67,32 @@ Forked from [supermemoryai/apple-mcp](https://github.com/supermemoryai/apple-mcp
 - See what's been recently added
 - Search by keyword — opens Photos with results in view
 
+### ⚙️ **Shortcuts** - Run anything Apple's Shortcuts can do *(added in this fork)*
+
+- List shortcuts (optionally filtered by folder, optionally with UUIDs)
+- List shortcut folders
+- Run a shortcut by name, pipe text into it, capture text output
+- Open a shortcut in the Shortcuts editor
+
+This is the force-multiplier: anything reachable from a Shortcut becomes
+callable here — **HomeKit** scenes/accessories, **Focus** modes, **Find My**
+queries, **Screen Time** controls, **Health** queries on iCloud-shared data,
+and any third-party app that exposes App Intents. Author the Shortcut once,
+invoke it from anywhere.
+
+### 🧭 **Safari** - Drive the browser like you mean it *(added in this fork)*
+
+- List all open tabs across windows (with window/tab indices and active flag)
+- Get the current front tab
+- Open a URL in a new tab, current tab, or new window (optional background mode)
+- Close a tab by URL substring or window/tab index
+- Activate (focus) a tab the same way
+- Run JavaScript in a tab — *requires Safari → Develop menu → "Allow JavaScript from Apple Events"*
+- Read bookmarks (folder + search filters)
+- Read the Reading List (unread-only filter)
+- Search browsing history with substring match and `sinceDays` window
+  — *requires the calling app to have Full Disk Access for `~/Library/Safari/History.db`*
+
 ## 🎭 The Magic of Chaining Commands
 
 Here's where it gets spicy. You can literally say:

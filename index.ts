@@ -26,6 +26,8 @@ let reminders: typeof import("./utils/reminders").default | null = null;
 let calendar: typeof import("./utils/calendar").default | null = null;
 let maps: typeof import("./utils/maps").default | null = null;
 let photos: typeof import("./utils/photos").default | null = null;
+let shortcuts: typeof import("./utils/shortcuts").default | null = null;
+let safari: typeof import("./utils/safari").default | null = null;
 
 // Type map for module names to their types
 type ModuleMap = {
@@ -37,6 +39,8 @@ type ModuleMap = {
 	calendar: typeof import("./utils/calendar").default;
 	maps: typeof import("./utils/maps").default;
 	photos: typeof import("./utils/photos").default;
+	shortcuts: typeof import("./utils/shortcuts").default;
+	safari: typeof import("./utils/safari").default;
 };
 
 // Helper function for lazy module loading
@@ -49,7 +53,9 @@ async function loadModule<
 		| "reminders"
 		| "calendar"
 		| "maps"
-		| "photos",
+		| "photos"
+		| "shortcuts"
+		| "safari",
 >(moduleName: T): Promise<ModuleMap[T]> {
 	if (safeModeFallback) {
 		console.error(`Loading ${moduleName} module on demand (safe mode)...`);
@@ -81,6 +87,12 @@ async function loadModule<
 			case "photos":
 				if (!photos) photos = (await import("./utils/photos")).default;
 				return photos as ModuleMap[T];
+			case "shortcuts":
+				if (!shortcuts) shortcuts = (await import("./utils/shortcuts")).default;
+				return shortcuts as ModuleMap[T];
+			case "safari":
+				if (!safari) safari = (await import("./utils/safari")).default;
+				return safari as ModuleMap[T];
 			default:
 				throw new Error(`Unknown module: ${moduleName}`);
 		}
@@ -107,6 +119,8 @@ loadingTimeout = setTimeout(() => {
 	calendar = null;
 	maps = null;
 	photos = null;
+	shortcuts = null;
+	safari = null;
 
 	// Proceed with server setup
 	initServer();
@@ -142,6 +156,12 @@ async function attemptEagerLoading() {
 
 		photos = (await import("./utils/photos")).default;
 		console.error("- Photos module loaded successfully");
+
+		shortcuts = (await import("./utils/shortcuts")).default;
+		console.error("- Shortcuts module loaded successfully");
+
+		safari = (await import("./utils/safari")).default;
+		console.error("- Safari module loaded successfully");
 
 		// If we get here, clear the timeout and proceed with eager loading
 		if (loadingTimeout) {
@@ -293,61 +313,114 @@ function initServer() {
 					try {
 						const notesModule = await loadModule("notes");
 						const { operation } = args;
+						const formatNoteLine = (n: { name: string; folder?: string; account?: string; modificationDate?: string; content: string }) => {
+							const meta: string[] = [];
+							if (n.folder) meta.push(n.folder);
+							if (n.account) meta.push(n.account);
+							if (n.modificationDate) meta.push(n.modificationDate);
+							const head = meta.length ? `${n.name}  [${meta.join(" · ")}]` : n.name;
+							return `${head}\n${n.content}`;
+						};
 
 						switch (operation) {
 							case "search": {
 								if (!args.searchText) {
-									throw new Error(
-										"Search text is required for search operation",
-									);
+									throw new Error("Search text is required for search operation");
 								}
-
-								const foundNotes = await notesModule.findNote(args.searchText);
+								const found = await notesModule.findNote(args.searchText, {
+									limit: args.limit,
+									contentPreview: args.contentPreview,
+									account: args.account,
+								});
 								return {
 									content: [
 										{
 											type: "text",
-											text: foundNotes.length
-												? foundNotes
-														.map((note) => `${note.name}:\n${note.content}`)
-														.join("\n\n")
-												: `No notes found for "${args.searchText}"`,
+											text: found.length
+												? `Found ${found.length} note(s) matching "${args.searchText}":\n\n${found.map(formatNoteLine).join("\n\n")}`
+												: `No notes found for "${args.searchText}".`,
 										},
 									],
+									notes: found,
 									isError: false,
 								};
 							}
 
 							case "list": {
-								const allNotes = await notesModule.getAllNotes();
+								const all = await notesModule.getAllNotes({
+									limit: args.limit,
+									contentPreview: args.contentPreview,
+									account: args.account,
+								});
 								return {
 									content: [
 										{
 											type: "text",
-											text: allNotes.length
-												? allNotes
-														.map((note) => `${note.name}:\n${note.content}`)
-														.join("\n\n")
-												: "No notes exist.",
+											text: all.length
+												? `Retrieved ${all.length} note(s):\n\n${all.map(formatNoteLine).join("\n\n")}`
+												: "No notes found.",
 										},
 									],
+									notes: all,
+									isError: false,
+								};
+							}
+
+							case "listFolders": {
+								const folders = await notesModule.listFolders({ account: args.account });
+								return {
+									content: [
+										{
+											type: "text",
+											text: folders.length
+												? `Found ${folders.length} folder(s):\n\n${folders.map((f) => `${f.parent ? `${f.parent} / ` : ""}${f.name}  [${f.account}]  (${f.noteCount})`).join("\n")}`
+												: "No folders found.",
+										},
+									],
+									folders,
+									isError: false,
+								};
+							}
+
+							case "listFromFolder": {
+								if (!args.folderName) {
+									throw new Error("folderName is required for listFromFolder operation");
+								}
+								const res = await notesModule.listFromFolder({
+									folderName: args.folderName,
+									account: args.account,
+									limit: args.limit,
+									contentPreview: args.contentPreview,
+								});
+								if (!res.success) {
+									return {
+										content: [{ type: "text", text: res.message ?? "Folder not found." }],
+										isError: true,
+									};
+								}
+								return {
+									content: [
+										{
+											type: "text",
+											text: res.notes.length
+												? `Found ${res.notes.length} note(s) in "${args.folderName}":\n\n${res.notes.map(formatNoteLine).join("\n\n")}`
+												: `Folder "${args.folderName}" is empty.`,
+										},
+									],
+									notes: res.notes,
 									isError: false,
 								};
 							}
 
 							case "create": {
 								if (!args.title || !args.body) {
-									throw new Error(
-										"Title and body are required for create operation",
-									);
+									throw new Error("Title and body are required for create operation");
 								}
-
 								const result = await notesModule.createNote(
 									args.title,
 									args.body,
 									args.folderName,
 								);
-
 								return {
 									content: [
 										{
@@ -847,22 +920,35 @@ end tell`;
 
 						const { operation } = args;
 
-						if (operation === "list") {
-							// List all reminders
-							const lists = await remindersModule.getAllLists();
-							const allReminders = await remindersModule.getAllReminders();
-							return {
-								content: [
-									{
-										type: "text",
-										text: `Found ${lists.length} lists and ${allReminders.length} reminders.`,
-									},
-								],
-								lists,
-								reminders: allReminders,
-								isError: false,
-							};
-						} else if (operation === "search") {
+							if (operation === "list") {
+								const lists = await remindersModule.getAllLists();
+								const allReminders = await remindersModule.getAllReminders(args.listName);
+								const summary = args.listName
+									? `${allReminders.length} incomplete reminder(s) in list "${args.listName}"`
+									: `${lists.length} list(s), ${allReminders.length} incomplete reminder(s) across all lists`;
+								const grouped = new Map<string, typeof allReminders>();
+								for (const r of allReminders) {
+									const key = r.listName || "(no list)";
+									const arr = grouped.get(key) ?? [];
+									arr.push(r);
+									grouped.set(key, arr);
+								}
+								const lines: string[] = [];
+								for (const [listName, items] of grouped) {
+									lines.push(`\n## ${listName} (${items.length})`);
+									for (const r of items.slice(0, 20)) {
+										const due = r.dueDate ? `  due ${r.dueDate}` : "";
+										lines.push(`  - ${r.name}${due}`);
+									}
+									if (items.length > 20) lines.push(`  ... and ${items.length - 20} more`);
+								}
+								return {
+									content: [{ type: "text", text: `${summary}.${lines.join("\n")}` }],
+									lists,
+									reminders: allReminders,
+									isError: false,
+								};
+							} else if (operation === "search") {
 							// Search for reminders
 							const { searchText } = args;
 							const results = await remindersModule.searchReminders(
@@ -1406,6 +1492,279 @@ end tell`;
 					}
 				}
 
+				case "shortcuts": {
+					if (!isShortcutsArgs(args)) {
+						throw new Error("Invalid arguments for shortcuts tool");
+					}
+
+					try {
+						const mod = await loadModule("shortcuts");
+						const { operation } = args;
+
+						switch (operation) {
+							case "list": {
+								const { shortcuts: list } = await mod.list({
+									folder: args.folder,
+									showIdentifiers: args.showIdentifiers,
+								});
+								const text = list.length === 0
+									? args.folder
+										? `No shortcuts found in folder "${args.folder}".`
+										: "No shortcuts found."
+									: `Found ${list.length} shortcut(s):\n\n${list
+										.map((s) => (s.id ? `${s.name} (${s.id})` : s.name))
+										.join("\n")}`;
+								return {
+									content: [{ type: "text", text }],
+									shortcuts: list,
+									isError: false,
+								};
+							}
+							case "listFolders": {
+								const { folders } = await mod.listFolders();
+								return {
+									content: [
+										{
+											type: "text",
+											text: folders.length === 0
+												? "No shortcut folders found."
+												: `Found ${folders.length} folder(s):\n\n${folders.join("\n")}`,
+										},
+									],
+									folders,
+									isError: false,
+								};
+							}
+							case "run": {
+								if (!args.name) {
+									throw new Error("name is required for run operation");
+								}
+								const res = await mod.run({
+									name: args.name,
+									input: args.input,
+									captureOutput: args.captureOutput,
+									timeoutMs: args.timeoutMs,
+								});
+								if (!res.success) {
+									const detail = res.timedOut
+										? "timed out"
+										: res.error.trim() || `exit code ${res.exitCode}`;
+									return {
+										content: [
+											{
+												type: "text",
+												text: `Shortcut "${args.name}" failed: ${detail}${res.output ? `\n\nPartial output:\n${res.output}` : ""}`,
+											},
+										],
+										isError: true,
+									};
+								}
+								return {
+									content: [
+										{
+											type: "text",
+											text: res.output.length > 0
+												? `Shortcut "${args.name}" ran successfully.\n\nOutput:\n${res.output}`
+												: `Shortcut "${args.name}" ran successfully (no output).`,
+										},
+									],
+									output: res.output,
+									isError: false,
+								};
+							}
+							case "open": {
+								if (!args.name) {
+									throw new Error("name is required for open operation");
+								}
+								const res = await mod.open(args.name);
+								return {
+									content: [{ type: "text", text: res.message }],
+									isError: !res.success,
+								};
+							}
+							default:
+								throw new Error(`Unknown shortcuts operation: ${operation}`);
+						}
+					} catch (error) {
+						const errorMessage = error instanceof Error ? error.message : String(error);
+						return {
+							content: [
+								{ type: "text", text: `Error in shortcuts tool: ${errorMessage}` },
+							],
+							isError: true,
+						};
+					}
+				}
+
+				case "safari": {
+					if (!isSafariArgs(args)) {
+						throw new Error("Invalid arguments for safari tool");
+					}
+
+					try {
+						const mod = await loadModule("safari");
+						const { operation } = args;
+
+						switch (operation) {
+							case "listTabs": {
+								const tabs = await mod.listTabs();
+								return {
+									content: [
+										{
+											type: "text",
+											text: tabs.length === 0
+												? "No Safari tabs open."
+												: `Found ${tabs.length} tab(s):\n\n${tabs.map((t) => `[w${t.windowIndex} t${t.tabIndex}${t.active ? " *" : ""}] ${t.title} — ${t.url}`).join("\n")}`,
+										},
+									],
+									tabs,
+									isError: false,
+								};
+							}
+							case "currentTab": {
+								const tab = await mod.currentTab();
+								return {
+									content: [
+										{
+											type: "text",
+											text: tab
+												? `Current tab: ${tab.title} — ${tab.url}`
+												: "No current tab.",
+										},
+									],
+									tab,
+									isError: false,
+								};
+							}
+							case "openUrl": {
+								if (!args.url) {
+									throw new Error("url is required for openUrl operation");
+								}
+								const res = await mod.openUrl({
+									url: args.url,
+									where: args.where,
+									background: args.background,
+								});
+								return {
+									content: [{ type: "text", text: res.message }],
+									isError: !res.success,
+								};
+							}
+							case "closeTab": {
+								const res = await mod.closeTab({
+									windowIndex: args.windowIndex,
+									tabIndex: args.tabIndex,
+									urlMatch: args.urlMatch,
+								});
+								return {
+									content: [{ type: "text", text: res.message }],
+									closed: res.closed,
+									isError: !res.success,
+								};
+							}
+							case "activateTab": {
+								const res = await mod.activateTab({
+									windowIndex: args.windowIndex,
+									tabIndex: args.tabIndex,
+									urlMatch: args.urlMatch,
+								});
+								return {
+									content: [{ type: "text", text: res.message }],
+									isError: !res.success,
+								};
+							}
+							case "runJs": {
+								if (!args.js) {
+									throw new Error("js is required for runJs operation");
+								}
+								const res = await mod.runJs({
+									js: args.js,
+									windowIndex: args.windowIndex,
+									tabIndex: args.tabIndex,
+								});
+								return {
+									content: [
+										{
+											type: "text",
+											text: res.success
+												? res.result || "(empty)"
+												: `runJs failed: ${res.message}`,
+										},
+									],
+									result: res.result,
+									isError: !res.success,
+								};
+							}
+							case "bookmarks": {
+								const items = await mod.bookmarks({
+									folder: args.folder,
+									searchText: args.searchText,
+								});
+								return {
+									content: [
+										{
+											type: "text",
+											text: items.length === 0
+												? "No bookmarks matched."
+												: `Found ${items.length} bookmark(s):\n\n${items.map((b) => `[${b.folder || "—"}] ${b.title} — ${b.url}`).join("\n")}`,
+										},
+									],
+									bookmarks: items,
+									isError: false,
+								};
+							}
+							case "readingList": {
+								const items = await mod.readingList({
+									unreadOnly: args.unreadOnly,
+								});
+								return {
+									content: [
+										{
+											type: "text",
+											text: items.length === 0
+												? args.unreadOnly
+													? "No unread Reading List items."
+													: "Reading List is empty."
+												: `Found ${items.length} Reading List item(s):\n\n${items.map((r) => `${r.read ? "  " : "● "}${r.title} — ${r.url}${r.previewText ? `\n    ${r.previewText.slice(0, 120)}` : ""}`).join("\n")}`,
+										},
+									],
+									readingList: items,
+									isError: false,
+								};
+							}
+							case "history": {
+								const items = await mod.history({
+									searchText: args.searchText,
+									limit: args.limit,
+									sinceDays: args.sinceDays,
+								});
+								return {
+									content: [
+										{
+											type: "text",
+											text: items.length === 0
+												? "No history entries matched."
+												: `Found ${items.length} history entr(y/ies):\n\n${items.map((h) => `${h.visitTime} — ${h.title} — ${h.url}`).join("\n")}`,
+										},
+									],
+									history: items,
+									isError: false,
+								};
+							}
+							default:
+								throw new Error(`Unknown safari operation: ${operation}`);
+						}
+					} catch (error) {
+						const errorMessage = error instanceof Error ? error.message : String(error);
+						return {
+							content: [
+								{ type: "text", text: `Error in safari tool: ${errorMessage}` },
+							],
+							isError: true,
+						};
+					}
+				}
+
 				default:
 					return {
 						content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -1465,49 +1824,37 @@ function isContactsArgs(args: unknown): args is { name?: string } {
 }
 
 function isNotesArgs(args: unknown): args is {
-	operation: "search" | "list" | "create";
+	operation: "search" | "list" | "listFolders" | "listFromFolder" | "create";
 	searchText?: string;
 	title?: string;
 	body?: string;
 	folderName?: string;
+	account?: string;
+	limit?: number;
+	contentPreview?: number;
 } {
-	if (typeof args !== "object" || args === null) {
+	if (typeof args !== "object" || args === null) return false;
+	const a = args as Record<string, unknown>;
+
+	if (typeof a.operation !== "string") return false;
+	if (!["search", "list", "listFolders", "listFromFolder", "create"].includes(a.operation))
 		return false;
-	}
 
-	const { operation } = args as { operation?: unknown };
-	if (typeof operation !== "string") {
-		return false;
+	if (a.operation === "search") {
+		if (typeof a.searchText !== "string" || a.searchText === "") return false;
 	}
-
-	if (!["search", "list", "create"].includes(operation)) {
-		return false;
+	if (a.operation === "listFromFolder") {
+		if (typeof a.folderName !== "string" || a.folderName === "") return false;
 	}
-
-	// Validate fields based on operation
-	if (operation === "search") {
-		const { searchText } = args as { searchText?: unknown };
-		if (typeof searchText !== "string" || searchText === "") {
+	if (a.operation === "create") {
+		if (typeof a.title !== "string" || a.title === "" || typeof a.body !== "string")
 			return false;
-		}
-	}
-
-	if (operation === "create") {
-		const { title, body } = args as { title?: unknown; body?: unknown };
-		if (typeof title !== "string" || title === "" || typeof body !== "string") {
+		if (a.folderName !== undefined && (typeof a.folderName !== "string" || a.folderName === ""))
 			return false;
-		}
-
-		// Check folderName if provided
-		const { folderName } = args as { folderName?: unknown };
-		if (
-			folderName !== undefined &&
-			(typeof folderName !== "string" || folderName === "")
-		) {
-			return false;
-		}
 	}
-
+	if (a.account !== undefined && typeof a.account !== "string") return false;
+	if (a.limit !== undefined && typeof a.limit !== "number") return false;
+	if (a.contentPreview !== undefined && typeof a.contentPreview !== "number") return false;
 	return true;
 }
 
@@ -1876,5 +2223,91 @@ function isPhotosArgs(args: unknown): args is {
 	const { limit } = args as { limit?: unknown };
 	if (limit !== undefined && typeof limit !== "number") return false;
 
+	return true;
+}
+
+function isShortcutsArgs(args: unknown): args is {
+	operation: "list" | "listFolders" | "run" | "open";
+	name?: string;
+	folder?: string;
+	input?: string;
+	captureOutput?: boolean;
+	timeoutMs?: number;
+	showIdentifiers?: boolean;
+} {
+	if (typeof args !== "object" || args === null) return false;
+	const { operation } = args as { operation?: unknown };
+	if (typeof operation !== "string") return false;
+	if (!["list", "listFolders", "run", "open"].includes(operation)) return false;
+
+	const a = args as Record<string, unknown>;
+	if (operation === "run" || operation === "open") {
+		if (typeof a.name !== "string" || a.name === "") return false;
+	}
+	if (a.folder !== undefined && typeof a.folder !== "string") return false;
+	if (a.input !== undefined && typeof a.input !== "string") return false;
+	if (a.captureOutput !== undefined && typeof a.captureOutput !== "boolean") return false;
+	if (a.timeoutMs !== undefined && typeof a.timeoutMs !== "number") return false;
+	if (a.showIdentifiers !== undefined && typeof a.showIdentifiers !== "boolean") return false;
+	return true;
+}
+
+function isSafariArgs(args: unknown): args is {
+	operation:
+		| "listTabs"
+		| "currentTab"
+		| "openUrl"
+		| "closeTab"
+		| "activateTab"
+		| "runJs"
+		| "bookmarks"
+		| "readingList"
+		| "history";
+	url?: string;
+	where?: "newTab" | "currentTab" | "newWindow";
+	background?: boolean;
+	windowIndex?: number;
+	tabIndex?: number;
+	urlMatch?: string;
+	js?: string;
+	folder?: string;
+	searchText?: string;
+	unreadOnly?: boolean;
+	limit?: number;
+	sinceDays?: number;
+} {
+	if (typeof args !== "object" || args === null) return false;
+	const { operation } = args as { operation?: unknown };
+	if (typeof operation !== "string") return false;
+	const validOps = [
+		"listTabs",
+		"currentTab",
+		"openUrl",
+		"closeTab",
+		"activateTab",
+		"runJs",
+		"bookmarks",
+		"readingList",
+		"history",
+	];
+	if (!validOps.includes(operation)) return false;
+
+	const a = args as Record<string, unknown>;
+	if (operation === "openUrl") {
+		if (typeof a.url !== "string" || a.url === "") return false;
+	}
+	if (operation === "runJs") {
+		if (typeof a.js !== "string" || a.js === "") return false;
+	}
+	if (a.where !== undefined && !["newTab", "currentTab", "newWindow"].includes(String(a.where))) return false;
+	if (a.background !== undefined && typeof a.background !== "boolean") return false;
+	if (a.windowIndex !== undefined && typeof a.windowIndex !== "number") return false;
+	if (a.tabIndex !== undefined && typeof a.tabIndex !== "number") return false;
+	if (a.urlMatch !== undefined && typeof a.urlMatch !== "string") return false;
+	if (a.folder !== undefined && typeof a.folder !== "string") return false;
+	if (a.searchText !== undefined && typeof a.searchText !== "string") return false;
+	if (a.unreadOnly !== undefined && typeof a.unreadOnly !== "boolean") return false;
+	if (a.limit !== undefined && typeof a.limit !== "number") return false;
+	if (a.sinceDays !== undefined && typeof a.sinceDays !== "number") return false;
 	return true;
 }

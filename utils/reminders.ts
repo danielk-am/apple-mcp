@@ -1,460 +1,451 @@
-import { runAppleScript } from "run-applescript";
+import { spawn } from "node:child_process";
 
-// Configuration
-const CONFIG = {
-	// Maximum reminders to process (to avoid performance issues)
-	MAX_REMINDERS: 50,
-	// Maximum lists to process
-	MAX_LISTS: 20,
-	// Timeout for operations
-	TIMEOUT_MS: 8000,
-};
+// On modern macOS, the AppleScript surface for Reminders is essentially dead
+// (`count of lists` returns 0 even with TCC granted). This module talks to
+// EventKit directly via JXA + ObjC bridge, which Apple's own apps use.
 
-// Define types for our reminders
-interface ReminderList {
-	name: string;
-	id: string;
+const PROLOGUE = `
+ObjC.import('EventKit');
+ObjC.import('Foundation');
+
+function writeStdout(s) {
+  var ns = $.NSString.alloc.initWithUTF8String(s);
+  $.NSFileHandle.fileHandleWithStandardOutput.writeData(ns.dataUsingEncoding($.NSUTF8StringEncoding));
 }
 
-interface Reminder {
+function ekAccessOk() {
+  // ObjC wraps the int; coerce before comparing.
+  var status = Number($.EKEventStore.authorizationStatusForEntityType($.EKEntityTypeReminder));
+  // 3 = fullAccess, 4 = writeOnly (older constant: 2 = authorized in pre-Sonoma)
+  return status === 3 || status === 4 || status === 2;
+}
+
+function unwrapDate(d) {
+  if (!d) return null;
+  try { return ObjC.unwrap(d.descriptionWithLocale(null)); } catch (e) { return null; }
+}
+
+function reminderToObj(r) {
+  return {
+    id: ObjC.unwrap(r.calendarItemIdentifier),
+    externalId: ObjC.unwrap(r.calendarItemExternalIdentifier) || null,
+    title: ObjC.unwrap(r.title) || '',
+    notes: ObjC.unwrap(r.notes) || '',
+    completed: r.completed === true || r.completed === 1,
+    completionDate: unwrapDate(r.completionDate),
+    creationDate: unwrapDate(r.creationDate),
+    modificationDate: unwrapDate(r.lastModifiedDate),
+    dueDate: r.dueDateComponents ? unwrapDate(r.dueDateComponents.date) : null,
+    priority: Number(r.priority) || 0,
+    listName: ObjC.unwrap(r.calendar.title) || '',
+    listId: ObjC.unwrap(r.calendar.calendarIdentifier) || '',
+  };
+}
+
+function calendarToObj(c) {
+  return {
+    name: ObjC.unwrap(c.title) || '',
+    id: ObjC.unwrap(c.calendarIdentifier) || '',
+    source: ObjC.unwrap(c.source.title) || '',
+    sourceType: Number(c.source.sourceType) || 0,
+    allowsContentModifications: c.allowsContentModifications === true,
+  };
+}
+
+function pumpUntil(cond, maxMs) {
+  var t0 = Date.now();
+  while (!cond() && Date.now() - t0 < maxMs) {
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.05));
+  }
+}
+
+var store = $.EKEventStore.alloc.init;
+if (!ekAccessOk()) {
+  writeStdout(JSON.stringify({ error: 'NO_ACCESS', message: 'Reminders/EventKit access not granted. Open System Settings > Privacy & Security > Reminders and enable access for the calling app, then restart it.' }));
+} else {
+`;
+
+const EPILOGUE = "\n}\n";
+
+interface JxaResult<T> {
+	ok: boolean;
+	data?: T;
+	error?: string;
+}
+
+function runJxa<T = any>(body: string, timeoutMs = 15000): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const script = PROLOGUE + body + EPILOGUE;
+		const child = spawn("osascript", ["-l", "JavaScript", "-e", script]);
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGTERM");
+			setTimeout(() => child.kill("SIGKILL"), 500);
+		}, timeoutMs);
+		child.stdout.on("data", (d) => {
+			stdout += d.toString("utf8");
+		});
+		child.stderr.on("data", (d) => {
+			stderr += d.toString("utf8");
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			if (timedOut) {
+				reject(new Error(`Reminders operation timed out after ${timeoutMs}ms`));
+				return;
+			}
+			if (code !== 0) {
+				reject(new Error(stderr.trim() || `osascript exit ${code}`));
+				return;
+			}
+			const trimmed = stdout.trim();
+			if (!trimmed) {
+				reject(new Error("Empty response from osascript"));
+				return;
+			}
+			try {
+				const parsed = JSON.parse(trimmed) as JxaResult<T>;
+				if (parsed && (parsed as any).error) {
+					reject(new Error((parsed as any).message || (parsed as any).error));
+					return;
+				}
+				resolve(parsed as unknown as T);
+			} catch (err) {
+				reject(new Error(`Failed to parse osascript output: ${trimmed.slice(0, 200)}`));
+			}
+		});
+		child.stdin.end();
+	});
+}
+
+function escJs(s: string): string {
+	return JSON.stringify(s);
+}
+
+// =============================================================================
+// Public types
+// =============================================================================
+
+export interface ReminderList {
 	name: string;
 	id: string;
-	body: string;
+	source: string;
+	sourceType: number;
+	allowsContentModifications: boolean;
+}
+
+export interface Reminder {
+	id: string;
+	externalId: string | null;
+	title: string;
+	notes: string;
 	completed: boolean;
+	completionDate: string | null;
+	creationDate: string | null;
+	modificationDate: string | null;
 	dueDate: string | null;
+	priority: number;
 	listName: string;
-	completionDate?: string | null;
-	creationDate?: string | null;
-	modificationDate?: string | null;
-	remindMeDate?: string | null;
-	priority?: number;
+	listId: string;
 }
 
-/**
- * Check if Reminders app is accessible
- */
-async function checkRemindersAccess(): Promise<boolean> {
+// =============================================================================
+// Public API
+// =============================================================================
+
+export async function requestAccess(): Promise<{ hasAccess: boolean; message: string }> {
 	try {
-		const script = `
-tell application "Reminders"
-    return name
-end tell`;
-
-		await runAppleScript(script);
-		return true;
-	} catch (error) {
-		console.error(
-			`Cannot access Reminders app: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		return false;
-	}
-}
-
-/**
- * Request Reminders app access and provide instructions if not available
- */
-async function requestRemindersAccess(): Promise<{ hasAccess: boolean; message: string }> {
-	try {
-		// First check if we already have access
-		const hasAccess = await checkRemindersAccess();
-		if (hasAccess) {
-			return {
-				hasAccess: true,
-				message: "Reminders access is already granted."
-			};
-		}
-
-		// If no access, provide clear instructions
+		await listLists();
+		return { hasAccess: true, message: "Reminders access granted." };
+	} catch (err) {
 		return {
 			hasAccess: false,
-			message: "Reminders access is required but not granted. Please:\n1. Open System Settings > Privacy & Security > Automation\n2. Find your terminal/app in the list and enable 'Reminders'\n3. Restart your terminal and try again\n4. If the option is not available, run this command again to trigger the permission dialog"
-		};
-	} catch (error) {
-		return {
-			hasAccess: false,
-			message: `Error checking Reminders access: ${error instanceof Error ? error.message : String(error)}`
+			message:
+				err instanceof Error
+					? err.message
+					: "Reminders access not granted. Enable in System Settings > Privacy & Security > Reminders.",
 		};
 	}
 }
 
-/**
- * Get all reminder lists (limited for performance)
- * @returns Array of reminder lists with their names and IDs
- */
-async function getAllLists(): Promise<ReminderList[]> {
+export async function listLists(): Promise<ReminderList[]> {
+	const body = `
+  var cals = store.calendarsForEntityType($.EKEntityTypeReminder);
+  var out = [];
+  for (var i = 0; i < cals.count; i++) {
+    out.push(calendarToObj(cals.objectAtIndex(i)));
+  }
+  writeStdout(JSON.stringify(out));
+`;
+	return runJxa<ReminderList[]>(body);
+}
+
+export async function listAll(opts?: {
+	listName?: string;
+	listId?: string;
+	includeCompleted?: boolean;
+	limit?: number;
+}): Promise<Reminder[]> {
+	const includeCompleted = opts?.includeCompleted === true;
+	const limit = opts?.limit ?? 1000;
+	const filter = opts?.listName
+		? `if (ObjC.unwrap(c.title) !== ${escJs(opts.listName)}) continue;`
+		: opts?.listId
+			? `if (ObjC.unwrap(c.calendarIdentifier) !== ${escJs(opts.listId)}) continue;`
+			: "";
+
+	const body = `
+  var allCals = store.calendarsForEntityType($.EKEntityTypeReminder);
+  var picked = $.NSMutableArray.alloc.init;
+  for (var i = 0; i < allCals.count; i++) {
+    var c = allCals.objectAtIndex(i);
+    ${filter}
+    picked.addObject(c);
+  }
+  if (Number(picked.count) === 0) { writeStdout(JSON.stringify([])); }
+  else {
+    // Fetch everything for the picked calendars and filter completion in JS —
+    // EventKit's incomplete-only factory has a colon-laden ObjC signature that
+    // JXA renders inconsistently. Cheap to filter; reminders DBs are small.
+    var predicate = store.predicateForRemindersInCalendars(picked);
+    var includeCompleted = ${includeCompleted ? "true" : "false"};
+    var done = false;
+    var out = [];
+    store.fetchRemindersMatchingPredicateCompletion(predicate, function(reminders) {
+      var total = reminders.count;
+      for (var i = 0; i < total; i++) {
+        var r = reminders.objectAtIndex(i);
+        var isDone = r.completed === true || r.completed === 1;
+        if (!includeCompleted && isDone) continue;
+        out.push(reminderToObj(r));
+        if (out.length >= ${limit}) break;
+      }
+      done = true;
+    });
+    pumpUntil(function() { return done; }, 10000);
+    writeStdout(JSON.stringify(out));
+  }
+`;
+	return runJxa<Reminder[]>(body, 20000);
+}
+
+export async function search(opts: {
+	searchText: string;
+	includeCompleted?: boolean;
+	listName?: string;
+	limit?: number;
+}): Promise<Reminder[]> {
+	const all = await listAll({
+		listName: opts.listName,
+		includeCompleted: opts.includeCompleted,
+		limit: 5000,
+	});
+	const q = opts.searchText.toLowerCase();
+	const out = all.filter(
+		(r) => r.title.toLowerCase().includes(q) || (r.notes && r.notes.toLowerCase().includes(q)),
+	);
+	return out.slice(0, opts.limit ?? 200);
+}
+
+export async function listFromList(opts: {
+	listName?: string;
+	listId?: string;
+	includeCompleted?: boolean;
+	limit?: number;
+}): Promise<{ success: boolean; reminders: Reminder[]; message?: string }> {
+	if (!opts.listName && !opts.listId) {
+		return {
+			success: false,
+			reminders: [],
+			message: "Either listName or listId is required.",
+		};
+	}
+	const rems = await listAll(opts);
+	return { success: true, reminders: rems };
+}
+
+export async function create(opts: {
+	title: string;
+	listName?: string;
+	listId?: string;
+	notes?: string;
+	dueDate?: string; // ISO date
+	priority?: number; // 0=none, 1=high, 5=medium, 9=low (EventKit convention)
+}): Promise<{ success: boolean; reminder?: Reminder; message?: string }> {
+	if (!opts.title || !opts.title.trim()) {
+		return { success: false, message: "Reminder title cannot be empty." };
+	}
+
+	const titleLit = escJs(opts.title);
+	const notesLit = escJs(opts.notes ?? "");
+	const listNameLit = opts.listName ? escJs(opts.listName) : "null";
+	const listIdLit = opts.listId ? escJs(opts.listId) : "null";
+	const dueLit = opts.dueDate ? escJs(opts.dueDate) : "null";
+	const priorityLit = String(Number.isFinite(opts.priority) ? opts.priority : 0);
+
+	const body = `
+  var cals = store.calendarsForEntityType($.EKEntityTypeReminder);
+  var target = null;
+  var wantName = ${listNameLit};
+  var wantId = ${listIdLit};
+  for (var i = 0; i < cals.count; i++) {
+    var c = cals.objectAtIndex(i);
+    var tName = ObjC.unwrap(c.title);
+    var tId = ObjC.unwrap(c.calendarIdentifier);
+    if (wantName && tName === wantName) { target = c; break; }
+    if (wantId && tId === wantId) { target = c; break; }
+  }
+  if (!target) {
+    // fall back to default reminder calendar
+    target = store.defaultCalendarForNewReminders;
+  }
+  if (!target) {
+    writeStdout(JSON.stringify({ error: 'NO_LIST', message: 'No reminders list available. Specify listName or listId.' }));
+  } else {
+    var rem = $.EKReminder.reminderWithEventStore(store);
+    rem.title = $.NSString.stringWithUTF8String(${titleLit});
+    var notesStr = ${notesLit};
+    if (notesStr) rem.notes = $.NSString.stringWithUTF8String(notesStr);
+    rem.calendar = target;
+    rem.priority = ${priorityLit};
+    var dueIso = ${dueLit};
+    if (dueIso) {
+      var formatter = $.NSISO8601DateFormatter.alloc.init;
+      formatter.formatOptions = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 8); // year/month/day/time/dashSeparator/internetDateTime
+      var date = formatter.dateFromString($.NSString.stringWithUTF8String(dueIso));
+      if (date) {
+        var cal = $.NSCalendar.currentCalendar;
+        var units = (1 << 2) | (1 << 4) | (1 << 8) | (1 << 16) | (1 << 32) | (1 << 64); // y/m/d/h/m/s — bitmask convenience
+        rem.dueDateComponents = cal.componentsFromDate(units, date);
+      }
+    }
+    var errRef = Ref();
+    var saved = store.saveReminderCommitError(rem, true, errRef);
+    if (!saved) {
+      writeStdout(JSON.stringify({ error: 'SAVE_FAILED', message: 'Failed to save reminder.' }));
+    } else {
+      writeStdout(JSON.stringify({ ok: true, reminder: reminderToObj(rem) }));
+    }
+  }
+`;
 	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
-
-		const script = `
-tell application "Reminders"
-    set listArray to {}
-    set listCount to 0
-
-    -- Get all lists
-    set allLists to lists
-
-    repeat with i from 1 to (count of allLists)
-        if listCount >= ${CONFIG.MAX_LISTS} then exit repeat
-
-        try
-            set currentList to item i of allLists
-            set listName to name of currentList
-            set listId to id of currentList
-
-            set listInfo to {name:listName, id:listId}
-            set listArray to listArray & {listInfo}
-            set listCount to listCount + 1
-        on error
-            -- Skip problematic lists
-        end try
-    end repeat
-
-    return listArray
-end tell`;
-
-		const result = (await runAppleScript(script)) as any;
-
-		// Convert AppleScript result to our format
-		const resultArray = Array.isArray(result) ? result : result ? [result] : [];
-
-		return resultArray.map((listData: any) => ({
-			name: listData.name || "Untitled List",
-			id: listData.id || "unknown-id",
-		}));
-	} catch (error) {
-		console.error(
-			`Error getting reminder lists: ${error instanceof Error ? error.message : String(error)}`,
+		const res = await runJxa<{ ok: boolean; reminder?: Reminder } | Reminder[]>(
+			body,
+			15000,
 		);
-		return [];
+		// runJxa already rejects on `error` payloads; success path is the wrapped object.
+		const wrapped = res as { ok?: boolean; reminder?: Reminder };
+		if (wrapped && wrapped.ok && wrapped.reminder) {
+			return { success: true, reminder: wrapped.reminder };
+		}
+		return { success: false, message: "Unexpected response from EventKit save." };
+	} catch (err) {
+		return {
+			success: false,
+			message: err instanceof Error ? err.message : String(err),
+		};
 	}
 }
 
-/**
- * Get all reminders from a specific list or all lists.
- * Uses bulk property fetches (`name of every reminder`) so AppleScript stays fast
- * even on libraries with hundreds of reminders. Completed reminders are excluded
- * via a `whose` clause for both speed and relevance.
- * @param listName Optional list name to filter by
- * @returns Array of incomplete reminders
- */
-async function getAllReminders(listName?: string): Promise<Reminder[]> {
-	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
-
-		const safeListName = listName ? listName.replace(/"/g, '\\"') : "";
-		const listSelector = listName
-			? `set targetLists to (every list whose name is "${safeListName}")`
-			: `set targetLists to every list`;
-
-		const script = `
-tell application "Reminders"
-    set output to {}
-    set totalCount to 0
-    ${listSelector}
-
-    repeat with currentList in targetLists
-        if totalCount >= ${CONFIG.MAX_REMINDERS} then exit repeat
-        try
-            set listNm to name of currentList
-            -- whose-clause filter pushes work into the app, way faster than JS-side filtering
-            set rems to (reminders of currentList whose completed is false)
-            set remCount to count of rems
-            if remCount > 0 then
-                set perListLimit to ${CONFIG.MAX_REMINDERS} - totalCount
-                if remCount > perListLimit then set remCount to perListLimit
-
-                -- Bulk fetch (one round-trip per property, not per item)
-                set rNames to name of rems
-                set rIds to id of rems
-
-                repeat with i from 1 to remCount
-                    set rBody to ""
-                    try
-                        set rBody to body of item i of rems
-                        if rBody is missing value then set rBody to ""
-                    end try
-                    set rDue to ""
-                    try
-                        set d to due date of item i of rems
-                        if d is not missing value then set rDue to d as string
-                    end try
-
-                    set end of output to {nm:(item i of rNames), idd:((item i of rIds) as string), bd:rBody, due:rDue, ln:listNm}
-                    set totalCount to totalCount + 1
-                end repeat
-            end if
-        on error
-            -- skip problematic lists
-        end try
-    end repeat
-
-    return output
-end tell`;
-
-		const result = (await runAppleScript(script)) as any;
-		const arr = Array.isArray(result) ? result : result ? [result] : [];
-
-		return arr.map((r: any) => ({
-			name: r.nm || "Untitled",
-			id: r.idd || "unknown-id",
-			body: r.bd || "",
-			completed: false,
-			dueDate: r.due && r.due !== "" ? r.due : null,
-			listName: r.ln || "Unknown",
-		}));
-	} catch (error) {
-		console.error(
-			`Error getting reminders: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		return [];
-	}
-}
-
-/**
- * Search for reminders by text in name or body.
- * Fetches all incomplete reminders via getAllReminders (which uses bulk AppleScript)
- * then filters in JS — much more reliable than AppleScript-side text matching.
- * @param searchText Text to search for in reminder names or notes
- * @returns Array of matching reminders
- */
-async function searchReminders(searchText: string): Promise<Reminder[]> {
-	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
-
-		if (!searchText || searchText.trim() === "") {
-			return [];
-		}
-
-		const all = await getAllReminders();
-		const needle = searchText.toLowerCase();
-		return all.filter(
-			(r) =>
-				r.name.toLowerCase().includes(needle) ||
-				(r.body && r.body.toLowerCase().includes(needle)),
-		);
-	} catch (error) {
-		console.error(
-			`Error searching reminders: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		return [];
-	}
-}
-
-/**
- * Create a new reminder (simplified for performance)
- * @param name Name of the reminder
- * @param listName Name of the list to add the reminder to (creates if doesn't exist)
- * @param notes Optional notes for the reminder
- * @param dueDate Optional due date for the reminder (ISO string)
- * @returns The created reminder
- */
-async function createReminder(
-	name: string,
-	listName: string = "Reminders",
-	notes?: string,
-	dueDate?: string,
-): Promise<Reminder> {
-	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
-
-		// Validate inputs
-		if (!name || name.trim() === "") {
-			throw new Error("Reminder name cannot be empty");
-		}
-
-		const cleanName = name.replace(/\"/g, '\\"');
-		const cleanListName = listName.replace(/\"/g, '\\"');
-		const cleanNotes = notes ? notes.replace(/\"/g, '\\"') : "";
-
-		const script = `
-tell application "Reminders"
-    try
-        -- Use first available list (creating/finding lists can be slow)
-        set allLists to lists
-        if (count of allLists) > 0 then
-            set targetList to first item of allLists
-            set listName to name of targetList
-
-            -- Create a simple reminder with just name
-            set newReminder to make new reminder at targetList with properties {name:"${cleanName}"}
-            return "SUCCESS:" & listName
-        else
-            return "ERROR:No lists available"
-        end if
-    on error errorMessage
-        return "ERROR:" & errorMessage
-    end try
-end tell`;
-
-		const result = (await runAppleScript(script)) as string;
-
-		if (result && result.startsWith("SUCCESS:")) {
-			const actualListName = result.replace("SUCCESS:", "");
-
-			return {
-				name: name,
-				id: "created-reminder-id",
-				body: notes || "",
-				completed: false,
-				dueDate: dueDate || null,
-				listName: actualListName,
-			};
-		} else {
-			throw new Error(`Failed to create reminder: ${result}`);
-		}
-	} catch (error) {
-		throw new Error(
-			`Failed to create reminder: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
-}
-
-interface OpenReminderResult {
+export async function open(searchText: string): Promise<{
 	success: boolean;
 	message: string;
 	reminder?: Reminder;
-}
-
-/**
- * Open the Reminders app and show a specific reminder (simplified)
- * @param searchText Text to search for in reminder names or notes
- * @returns Result of the operation
- */
-async function openReminder(searchText: string): Promise<OpenReminderResult> {
-	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			return { success: false, message: accessResult.message };
-		}
-
-		// First search for the reminder
-		const matchingReminders = await searchReminders(searchText);
-
-		if (matchingReminders.length === 0) {
-			return { success: false, message: "No matching reminders found" };
-		}
-
-		// Open the Reminders app
-		const script = `
-tell application "Reminders"
-    activate
-    return "SUCCESS"
-end tell`;
-
-		const result = (await runAppleScript(script)) as string;
-
-		if (result === "SUCCESS") {
-			return {
-				success: true,
-				message: "Reminders app opened",
-				reminder: matchingReminders[0],
-			};
-		} else {
-			return { success: false, message: "Failed to open Reminders app" };
-		}
-	} catch (error) {
+}> {
+	const matches = await search({ searchText, includeCompleted: false, limit: 1 });
+	const script = `tell application "Reminders" to activate`;
+	await new Promise<void>((resolve) => {
+		const c = spawn("osascript", ["-e", script]);
+		c.on("close", () => resolve());
+		c.stdin.end();
+	});
+	if (matches.length === 0) {
 		return {
-			success: false,
-			message: `Failed to open reminder: ${error instanceof Error ? error.message : String(error)}`,
+			success: true,
+			message: `Opened Reminders. No reminder matched "${searchText}".`,
 		};
 	}
+	return {
+		success: true,
+		message: `Opened Reminders. Top match: "${matches[0].title}" in ${matches[0].listName}.`,
+		reminder: matches[0],
+	};
 }
 
-/**
- * Get reminders from a specific list by its AppleScript id.
- * Uses the same bulk-fetch pattern as getAllReminders for speed.
- * @param listId ID of the list to get reminders from
- * @param props Reserved for future per-property selection (currently ignored)
- * @returns Array of incomplete reminders in that list
- */
-async function getRemindersFromListById(
-	listId: string,
-	props?: string[],
-): Promise<Reminder[]> {
-	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
-
-		const safeId = listId.replace(/"/g, '\\"');
-
-		const script = `
-tell application "Reminders"
-    set output to {}
-    try
-        set targetList to (first list whose id is "${safeId}")
-        set listNm to name of targetList
-        set rems to (reminders of targetList whose completed is false)
-        set remCount to count of rems
-        if remCount > ${CONFIG.MAX_REMINDERS} then set remCount to ${CONFIG.MAX_REMINDERS}
-
-        if remCount > 0 then
-            set rNames to name of rems
-            set rIds to id of rems
-
-            repeat with i from 1 to remCount
-                set rBody to ""
-                try
-                    set rBody to body of item i of rems
-                    if rBody is missing value then set rBody to ""
-                end try
-                set rDue to ""
-                try
-                    set d to due date of item i of rems
-                    if d is not missing value then set rDue to d as string
-                end try
-
-                set end of output to {nm:(item i of rNames), idd:((item i of rIds) as string), bd:rBody, due:rDue, ln:listNm}
-            end repeat
-        end if
-    on error errMsg
-        return "ERROR:" & errMsg
-    end try
-
-    return output
-end tell`;
-
-		const result = (await runAppleScript(script)) as any;
-		if (typeof result === "string" && result.startsWith("ERROR:")) {
-			throw new Error(result.replace("ERROR:", ""));
-		}
-		const arr = Array.isArray(result) ? result : result ? [result] : [];
-
-		return arr.map((r: any) => ({
-			name: r.nm || "Untitled",
-			id: r.idd || "unknown-id",
-			body: r.bd || "",
-			completed: false,
-			dueDate: r.due && r.due !== "" ? r.due : null,
-			listName: r.ln || "Unknown",
-		}));
-	} catch (error) {
-		console.error(
-			`Error getting reminders from list by ID: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		return [];
-	}
-}
+// =============================================================================
+// Backwards-compatible default export
+// =============================================================================
 
 export default {
-	getAllLists,
-	getAllReminders,
-	searchReminders,
-	createReminder,
-	openReminder,
-	getRemindersFromListById,
-	requestRemindersAccess,
+	requestRemindersAccess: requestAccess,
+	getAllLists: async () => {
+		const lists = await listLists();
+		return lists.map((l) => ({ name: l.name, id: l.id }));
+	},
+	getAllReminders: async (listName?: string) => {
+		const r = await listAll({ listName, includeCompleted: false });
+		return r.map((x) => ({
+			name: x.title,
+			id: x.id,
+			body: x.notes,
+			completed: x.completed,
+			dueDate: x.dueDate,
+			listName: x.listName,
+		}));
+	},
+	searchReminders: async (searchText: string) => {
+		const r = await search({ searchText, includeCompleted: false });
+		return r.map((x) => ({
+			name: x.title,
+			id: x.id,
+			body: x.notes,
+			completed: x.completed,
+			dueDate: x.dueDate,
+			listName: x.listName,
+		}));
+	},
+	createReminder: async (
+		name: string,
+		listName?: string,
+		notes?: string,
+		dueDate?: string,
+	) => {
+		const res = await create({ title: name, listName, notes, dueDate });
+		if (!res.success || !res.reminder)
+			throw new Error(res.message ?? "Failed to create reminder");
+		return {
+			name: res.reminder.title,
+			id: res.reminder.id,
+			body: res.reminder.notes,
+			completed: res.reminder.completed,
+			dueDate: res.reminder.dueDate,
+			listName: res.reminder.listName,
+		};
+	},
+	openReminder: async (searchText: string) => {
+		const r = await open(searchText);
+		return r;
+	},
+	getRemindersFromListById: async (listId: string) => {
+		const r = await listAll({ listId, includeCompleted: false });
+		return r.map((x) => ({
+			name: x.title,
+			id: x.id,
+			body: x.notes,
+			completed: x.completed,
+			dueDate: x.dueDate,
+			listName: x.listName,
+		}));
+	},
+
+	// New, richer surface:
+	listLists,
+	listAll,
+	search,
+	listFromList,
+	create,
+	open,
 };
